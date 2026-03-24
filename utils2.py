@@ -73,9 +73,10 @@ class ContextoExecucao:
     processados: int = 0
 
 
-def baixar_extrair_mesclar(
+def baixar_extrair_mesclar_url_v2(
     url_origem: str,
     *,
+    nome_pasta_execucao: Optional[str] = None,
     base_dir_execucao: Optional[Path | str] = None,
     pasta_saida_mesclas: Optional[Path | str] = None,
     chunk_size_csv: int = 100_000,
@@ -94,11 +95,12 @@ def baixar_extrair_mesclar(
 
     Estratégia adotada
     ------------------
-    - Se for arquivo `.zip`, cria uma pasta com timestamp, baixa o ZIP para
-      esta pasta, extrai os arquivos compatíveis nela e trata recursivamente
-      ZIPs internos.
+    - Se for arquivo `.zip`, cria a pasta `processamentos` (caso não exista),
+      cria uma subpasta de execução no formato `<nome>_<timestamp>`, baixa o ZIP
+      para esta pasta, extrai os arquivos compatíveis nela e trata
+      recursivamente ZIPs internos.
     - Se for arquivo tabular compatível, baixa o arquivo e o registra para
-      mesclagem. Se necessário, pode convertê-lo para CSV.
+      mesclagem. Se necessário, converte para CSV.
     - Se for pasta FTP, lista recursivamente os arquivos da estrutura e baixa
       os arquivos compatíveis mantendo a mesma estrutura do diretório remoto.
     - Se for página HTTP/HTTPS, faz o parsing da listagem, identifica links
@@ -142,11 +144,21 @@ def baixar_extrair_mesclar(
     - `AC_202401_HOSP_REM.zip`  -> grupo `REM`
 
     Arquivos do mesmo grupo são concatenados entre si. Ao final, a função:
-    - salva um arquivo `.csv` por grupo na pasta atual de execução
-      (`Path.cwd()` ou `pasta_saida_mesclas`, se informada), com nomes
-      no padrão `mescla_<GRUPO>.csv`;
+    - salva um arquivo `.csv` por grupo na pasta atual de saída
+      (`Path.cwd()` ou `pasta_saida_mesclas`, se informada), com nomes no
+      padrão `mescla_<GRUPO>.csv`;
     - opcionalmente retorna um `DataFrame` unificado contendo todos os grupos;
-    - adiciona as colunas `arquivo_origem` e `grupo_mescla`.
+    - adiciona as colunas `arquivo_origem` e `grupo_mescla`;
+    - imprime no console os comandos `pd.read_csv(...)` para ler cada arquivo
+      mesclado gerado.
+
+    Pasta de execução
+    -----------------
+    - A função cria uma pasta `processamentos`, caso ela ainda não exista.
+    - Dentro dela, cria a pasta da execução no formato:
+      `<nome_informado_pelo_usuario>_<timestamp>`.
+    - Se `nome_pasta_execucao` não for informado, a função solicita esse valor
+      via `input()`.
 
     Logs de execução
     ----------------
@@ -166,8 +178,12 @@ def baixar_extrair_mesclar(
         - URL FTP apontando para uma pasta
         - URL HTTP/HTTPS apontando para uma página com listagem de arquivos
         - URL HTTP/HTTPS/FTP apontando para uma estrutura com subpastas
+    nome_pasta_execucao : Optional[str], default None
+        Nome-base da pasta da execução, que será criado antes do timestamp.
+        Exemplo: `ans_igr` -> `processamentos/ans_igr_20260324_001530`.
+        Se None, a função solicitará esse valor ao usuário via `input()`.
     base_dir_execucao : Optional[Path | str], default None
-        Diretório base onde será criada a pasta timestamp da execução.
+        Diretório base onde a pasta `processamentos` será criada.
         Se None, usa `Path.cwd()`.
     pasta_saida_mesclas : Optional[Path | str], default None
         Pasta onde os arquivos `mescla_<GRUPO>.csv` serão salvos.
@@ -188,7 +204,7 @@ def baixar_extrair_mesclar(
     ResultadoProcessamento
         Estrutura com:
         - `conteudo_zip`: bytes do ZIP baixado, quando aplicável e solicitado
-        - `pasta_execucao`: pasta timestamp da execução
+        - `pasta_execucao`: pasta da execução criada dentro de `processamentos`
         - `pasta_ingestao`: pasta de staging/ingestão
         - `manifesto_arquivos`: caminho do manifesto CSV
         - `arquivos_lidos`: lista de arquivos lidos com sucesso
@@ -205,6 +221,9 @@ def baixar_extrair_mesclar(
     - `mescla_REM.csv`
     - etc.
 
+    Também imprime no console comandos prontos do pandas para leitura desses
+    arquivos, permitindo que o usuário apenas copie e cole no notebook.
+
     Se ocorrer erro ao salvar algum arquivo de saída, o erro será registrado na
     lista `erros`, sem interromper o processamento dos demais grupos.
 
@@ -213,7 +232,8 @@ def baixar_extrair_mesclar(
     requests.HTTPError
         Se ocorrer erro ao baixar um arquivo via HTTP/HTTPS.
     ValueError
-        Se a URL não for suportada ou se nenhum arquivo compatível for lido.
+        Se a URL não for suportada, se nenhum arquivo compatível for lido
+        ou se o nome informado para a pasta da execução for inválido.
     """
     extensoes_tabulares_suportadas: set[str] = {".csv", ".xlsx", ".xls", ".ods"}
     extensoes_processaveis: set[str] = extensoes_tabulares_suportadas | {".zip"}
@@ -223,6 +243,7 @@ def baixar_extrair_mesclar(
     arquivos_lidos: list[str] = []
     arquivos_ignorados: list[str] = []
     erros: list[ErroLeitura] = []
+    caminhos_mesclas_geradas: dict[str, Path] = {}
 
     def criar_barra_progresso(processados: int, total: int, largura: int = 26) -> str:
         """
@@ -302,14 +323,101 @@ def baixar_extrair_mesclar(
 
         print("═" * 108)
 
+    def normalizar_nome_pasta_usuario(nome: str) -> str:
+        """
+        Normaliza o nome informado pelo usuário para uso seguro como nome de pasta.
+
+        Regras aplicadas:
+        - remove espaços extras nas extremidades;
+        - remove acentuação;
+        - converte espaços e separadores para underscore;
+        - remove caracteres não alfanuméricos;
+        - colapsa underscores duplicados.
+
+        Parameters
+        ----------
+        nome : str
+            Nome informado pelo usuário.
+
+        Returns
+        -------
+        str
+            Nome normalizado para uso como pasta.
+
+        Raises
+        ------
+        ValueError
+            Se o nome informado for vazio ou resultar em string inválida.
+        """
+        nome_limpo: str = nome.strip()
+        if not nome_limpo:
+            raise ValueError("O nome da pasta de execução não pode ser vazio.")
+
+        nome_normalizado: str = unicodedata.normalize("NFKD", nome_limpo)
+        nome_sem_acento: str = "".join(
+            caractere
+            for caractere in nome_normalizado
+            if not unicodedata.combining(caractere)
+        )
+
+        nome_sem_acento = (
+            nome_sem_acento
+            .replace(" ", "_")
+            .replace("-", "_")
+            .replace("/", "_")
+            .replace("\\", "_")
+        )
+
+        caracteres_processados: list[str] = []
+        for caractere in nome_sem_acento:
+            caracteres_processados.append(caractere if caractere.isalnum() or caractere == "_" else "_")
+
+        nome_saida: str = "".join(caracteres_processados).strip("_")
+
+        while "__" in nome_saida:
+            nome_saida = nome_saida.replace("__", "_")
+
+        if not nome_saida:
+            raise ValueError("O nome informado para a pasta da execução é inválido.")
+
+        return nome_saida
+
+    def obter_nome_base_pasta_execucao() -> str:
+        """
+        Obtém o nome-base da pasta da execução.
+
+        Se `nome_pasta_execucao` tiver sido informado, usa esse valor.
+        Caso contrário, solicita ao usuário via `input()`.
+
+        Returns
+        -------
+        str
+            Nome-base normalizado da pasta da execução.
+        """
+        if nome_pasta_execucao is not None:
+            return normalizar_nome_pasta_usuario(nome_pasta_execucao)
+
+        nome_informado: str = input(
+            "Informe o nome da pasta de processamento (será usado antes do timestamp): "
+        )
+        return normalizar_nome_pasta_usuario(nome_informado)
+
     def criar_pasta_timestamp(base_dir: Optional[Path | str] = None) -> ContextoExecucao:
         """
-        Cria a estrutura de pastas da execução com timestamp.
+        Cria a estrutura de pastas da execução com timestamp dentro da pasta
+        `processamentos`.
+
+        Estrutura criada:
+        - `<base_dir>/processamentos/`
+        - `<base_dir>/processamentos/<nome>_<timestamp>/`
+        - `<base_dir>/processamentos/<nome>_<timestamp>/ingestao/`
+        - `<base_dir>/processamentos/<nome>_<timestamp>/ingestao/downloads/`
+        - `<base_dir>/processamentos/<nome>_<timestamp>/ingestao/extraidos/`
 
         Parameters
         ----------
         base_dir : Optional[Path | str], default None
-            Diretório base onde a pasta da execução será criada.
+            Diretório base onde a pasta `processamentos` será criada.
             Se None, usa `Path.cwd()`.
 
         Returns
@@ -318,8 +426,13 @@ def baixar_extrair_mesclar(
             Contexto contendo os caminhos de trabalho.
         """
         base: Path = Path(base_dir) if base_dir is not None else Path.cwd()
+        pasta_processamentos: Path = base / "processamentos"
+        pasta_processamentos.mkdir(parents=True, exist_ok=True)
+
+        nome_base_pasta: str = obter_nome_base_pasta_execucao()
         timestamp: str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pasta_execucao: Path = base / f"processamento_{timestamp}"
+
+        pasta_execucao: Path = pasta_processamentos / f"{nome_base_pasta}_{timestamp}"
         pasta_ingestao: Path = pasta_execucao / "ingestao"
         pasta_downloads: Path = pasta_ingestao / "downloads"
         pasta_extraidos: Path = pasta_ingestao / "extraidos"
@@ -1445,6 +1558,37 @@ def baixar_extrair_mesclar(
             header=escrever_cabecalho,
         )
 
+    def imprimir_chamados_leitura_pandas(caminhos_arquivos: dict[str, Path]) -> None:
+        """
+        Imprime no console comandos prontos do pandas para leitura dos arquivos
+        mesclados gerados.
+
+        Exemplo de saída:
+        `df_mescla_cons = pd.read_csv(r"/caminho/mescla_CONS.csv", encoding="utf-8-sig", low_memory=False)`
+
+        Parameters
+        ----------
+        caminhos_arquivos : dict[str, Path]
+            Dicionário em que a chave é o grupo e o valor é o caminho do arquivo
+            `mescla_<GRUPO>.csv`.
+        """
+        if not caminhos_arquivos:
+            return
+
+        print("\n" + "═" * 108)
+        print("📌 COMANDOS PRONTOS PARA LEITURA DOS ARQUIVOS MESCLADOS NO PANDAS")
+        print("Cole os comandos abaixo no notebook:\n")
+
+        for grupo in sorted(caminhos_arquivos):
+            caminho_arquivo: Path = caminhos_arquivos[grupo]
+            nome_variavel: str = f"df_mescla_{normalizar_nome_arquivo_saida(grupo).lower()}"
+            print(
+                f'{nome_variavel} = pd.read_csv(r"{str(caminho_arquivo)}", '
+                f'encoding="utf-8-sig", low_memory=False)'
+            )
+
+        print("═" * 108)
+
     def mesclar_arquivos_ingeridos() -> Optional[pd.DataFrame]:
         """
         Executa a mesclagem incremental a partir do manifesto de ingestão.
@@ -1522,6 +1666,7 @@ def baixar_extrair_mesclar(
 
                 grupos_gerados.add(grupo_mescla)
                 arquivos_lidos.append(arquivo_origem)
+                caminhos_mesclas_geradas[grupo_mescla] = caminho_saida
 
                 atualizar_progresso_global(
                     fase="mesclagem",
@@ -1561,6 +1706,8 @@ def baixar_extrair_mesclar(
             total=len(grupos_gerados),
             icone="💾",
         )
+
+        imprimir_chamados_leitura_pandas(caminhos_mesclas_geradas)
 
         if not retornar_df_unificado:
             return None
