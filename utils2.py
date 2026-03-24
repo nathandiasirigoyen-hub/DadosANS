@@ -100,7 +100,7 @@ def baixar_extrair_mesclar(
       para esta pasta, extrai os arquivos compatíveis nela e trata
       recursivamente ZIPs internos.
     - Se for arquivo tabular compatível, baixa o arquivo e o registra para
-      mesclagem. Se necessário, converte para CSV.
+      processamento posterior. Se necessário, converte para CSV.
     - Se for pasta FTP, lista recursivamente os arquivos da estrutura e baixa
       os arquivos compatíveis mantendo a mesma estrutura do diretório remoto.
     - Se for página HTTP/HTTPS, faz o parsing da listagem, identifica links
@@ -108,6 +108,9 @@ def baixar_extrair_mesclar(
       automaticamente, baixando os arquivos compatíveis e mantendo a estrutura.
     - Se qualquer uma das opções anteriores contiver arquivos `.zip`, a função
       baixa, extrai e processa recursivamente esses arquivos `.zip`.
+    - Se houver apenas 1 arquivo compatível ingerido, a função não dispara a
+      mesclagem, não gera arquivo `mescla_<GRUPO>.csv` e imprime apenas os
+      comandos de leitura do(s) arquivo(s) original(is) baixado(s)/gerado(s).
 
     Extensões suportadas
     --------------------
@@ -140,17 +143,19 @@ def baixar_extrair_mesclar(
 
     Exemplos:
     - `AC_202401_HOSP_CONS.zip` -> grupo `CONS`
-    - `AC_202401_HOSP_DET.zip`  -> grupo `DET`
-    - `AC_202401_HOSP_REM.zip`  -> grupo `REM`
+    - `AC_202401_HOSP_DET.zip` -> grupo `DET`
+    - `AC_202401_HOSP_REM.zip` -> grupo `REM`
 
-    Arquivos do mesmo grupo são concatenados entre si. Ao final, a função:
+    Arquivos do mesmo grupo são concatenados entre si somente quando houver
+    mais de um arquivo compatível ingerido. Ao final, a função:
     - salva um arquivo `.csv` por grupo na pasta atual de saída
       (`Path.cwd()` ou `pasta_saida_mesclas`, se informada), com nomes no
-      padrão `mescla_<GRUPO>.csv`;
-    - opcionalmente retorna um `DataFrame` unificado contendo todos os grupos;
-    - adiciona as colunas `arquivo_origem` e `grupo_mescla`;
-    - imprime no console os comandos `pd.read_csv(...)` para ler cada arquivo
-      mesclado gerado.
+      padrão `mescla_<GRUPO>.csv`, quando a mesclagem for aplicável;
+    - opcionalmente retorna um `DataFrame` unificado;
+    - adiciona as colunas `arquivo_origem` e `grupo_mescla` ao resultado
+      unificado, quando ele for montado;
+    - imprime no console os comandos de leitura do pandas para os arquivos
+      originais baixados/gerados e também para os arquivos mesclados, se houver.
 
     Pasta de execução
     -----------------
@@ -221,8 +226,8 @@ def baixar_extrair_mesclar(
     - `mescla_REM.csv`
     - etc.
 
-    Também imprime no console comandos prontos do pandas para leitura desses
-    arquivos, permitindo que o usuário apenas copie e cole no notebook.
+    Também imprime no console comandos prontos do pandas para leitura dos
+    arquivos originais baixados/gerados e dos arquivos mesclados, se houver.
 
     Se ocorrer erro ao salvar algum arquivo de saída, o erro será registrado na
     lista `erros`, sem interromper o processamento dos demais grupos.
@@ -1560,11 +1565,16 @@ def baixar_extrair_mesclar(
 
     def imprimir_chamados_leitura_pandas(caminhos_arquivos: dict[str, Path]) -> None:
         """
-        Imprime no console comandos prontos do pandas para leitura dos arquivos
-        mesclados gerados.
+        Imprime no console comandos prontos do pandas para leitura de:
 
-        Exemplo de saída:
-        `df_mescla_cons = pd.read_csv(r"/caminho/mescla_CONS.csv", encoding="utf-8-sig", low_memory=False)`
+        1. arquivos originais baixados/gerados na pasta de processamento,
+           usando os caminhos reais registrados no manifesto;
+        2. arquivos mesclados por grupo (`mescla_<GRUPO>.csv`), quando existirem.
+
+        Regras:
+        - Se houver arquivos originais, imprime seus comandos de leitura.
+        - Se houver arquivos mesclados, imprime também seus comandos.
+        - Se não houver arquivos mesclados, imprime apenas os arquivos originais.
 
         Parameters
         ----------
@@ -1572,20 +1582,116 @@ def baixar_extrair_mesclar(
             Dicionário em que a chave é o grupo e o valor é o caminho do arquivo
             `mescla_<GRUPO>.csv`.
         """
-        if not caminhos_arquivos:
+        manifesto_df: pd.DataFrame = pd.read_csv(
+            contexto.manifesto_arquivos,
+            encoding="utf-8-sig",
+            keep_default_na=False
+        )
+
+        def montar_comando_leitura(caminho_arquivo: Path, nome_variavel: str) -> Optional[str]:
+            """
+            Monta o comando do pandas adequado à extensão do arquivo.
+
+            Parameters
+            ----------
+            caminho_arquivo : Path
+                Caminho do arquivo a ser lido.
+            nome_variavel : str
+                Nome da variável que receberá o DataFrame.
+
+            Returns
+            -------
+            Optional[str]
+                Comando pronto para leitura com pandas, ou None se a extensão
+                não for suportada.
+            """
+            extensao: str = caminho_arquivo.suffix.lower()
+            caminho_str: str = str(caminho_arquivo)
+
+            if extensao == ".csv":
+                return (
+                    f'{nome_variavel} = pd.read_csv(r"{caminho_str}", '
+                    f'encoding="utf-8-sig", low_memory=False)'
+                )
+
+            if extensao == ".xlsx":
+                return f'{nome_variavel} = pd.read_excel(r"{caminho_str}", engine="openpyxl")'
+
+            if extensao == ".xls":
+                return f'{nome_variavel} = pd.read_excel(r"{caminho_str}", engine="xlrd")'
+
+            if extensao == ".ods":
+                return f'{nome_variavel} = pd.read_excel(r"{caminho_str}", engine="odf")'
+
+            return None
+
+        def obter_caminho_original_para_leitura(registro: pd.Series) -> Path:
+            """
+            Determina o caminho do arquivo original a ser mostrado no comando
+            de leitura.
+
+            Regras:
+            - `arquivo_tabular_convertido` -> mostra o arquivo original baixado
+              na pasta `downloads`, usando `arquivo_origem`;
+            - demais casos -> usa `caminho_local` registrado no manifesto.
+            """
+            origem_tipo: str = str(registro["origem_tipo"]).strip()
+            caminho_local: Path = Path(str(registro["caminho_local"]).strip())
+            arquivo_origem_registro: str = str(registro["arquivo_origem"]).strip()
+
+            if origem_tipo == "arquivo_tabular_convertido" and arquivo_origem_registro:
+                return contexto.pasta_downloads / Path(arquivo_origem_registro).name
+
+            return caminho_local
+
+        if manifesto_df.empty and not caminhos_arquivos:
             return
 
         print("\n" + "═" * 108)
-        print("📌 COMANDOS PRONTOS PARA LEITURA DOS ARQUIVOS MESCLADOS NO PANDAS")
+        print("📌 COMANDOS PRONTOS PARA LEITURA DOS ARQUIVOS NO PANDAS")
         print("Cole os comandos abaixo no notebook:\n")
 
-        for grupo in sorted(caminhos_arquivos):
-            caminho_arquivo: Path = caminhos_arquivos[grupo]
-            nome_variavel: str = f"df_mescla_{normalizar_nome_arquivo_saida(grupo).lower()}"
-            print(
-                f'{nome_variavel} = pd.read_csv(r"{str(caminho_arquivo)}", '
-                f'encoding="utf-8-sig", low_memory=False)'
-            )
+        # ---------------------------------------------------------------------
+        # 1) Arquivos originais baixados/gerados
+        # ---------------------------------------------------------------------
+        if not manifesto_df.empty:
+            print("# Arquivos originais baixados/gerados")
+
+            caminhos_originais_ja_impressos: set[str] = set()
+
+            for _, registro in manifesto_df.iterrows():
+                caminho_original: Path = obter_caminho_original_para_leitura(registro)
+                caminho_original_str: str = str(caminho_original).strip()
+
+                if not caminho_original_str or caminho_original_str in caminhos_originais_ja_impressos:
+                    continue
+
+                caminhos_originais_ja_impressos.add(caminho_original_str)
+
+                nome_variavel_base: str = normalizar_nome_pasta_usuario(caminho_original.stem).lower()
+                nome_variavel: str = f"df_origem_{nome_variavel_base}"
+
+                comando_origem: Optional[str] = montar_comando_leitura(caminho_original, nome_variavel)
+                if comando_origem:
+                    print(comando_origem)
+
+            if caminhos_arquivos:
+                print()
+
+        # ---------------------------------------------------------------------
+        # 2) Arquivos mesclados por grupo, se houver
+        # ---------------------------------------------------------------------
+        if caminhos_arquivos:
+            print("# Arquivos mesclados por grupo")
+
+            for grupo in sorted(caminhos_arquivos):
+                caminho_arquivo: Path = caminhos_arquivos[grupo]
+                nome_variavel: str = f"df_mescla_{normalizar_nome_arquivo_saida(grupo).lower()}"
+
+                print(
+                    f'{nome_variavel} = pd.read_csv(r"{str(caminho_arquivo)}", '
+                    f'encoding="utf-8-sig", low_memory=False)'
+                )
 
         print("═" * 108)
 
@@ -1600,6 +1706,12 @@ def baixar_extrair_mesclar(
         - evita manter todos os DataFrames em memória;
         - opcionalmente reconstrói `df_unificado` no final.
 
+        Regras adicionais:
+        - Se houver apenas 1 arquivo compatível ingerido, a função não executa
+          a mesclagem e não gera arquivo `mescla_<GRUPO>.csv`.
+        - Nesse cenário, imprime somente os comandos de leitura dos arquivos
+          originais baixados/gerados.
+
         Returns
         -------
         Optional[pd.DataFrame]
@@ -1612,13 +1724,57 @@ def baixar_extrair_mesclar(
         """
         pasta_saida = Path(pasta_saida_mesclas) if pasta_saida_mesclas is not None else Path.cwd()
 
-        manifesto_df: pd.DataFrame = pd.read_csv(contexto.manifesto_arquivos, encoding="utf-8-sig")
+        manifesto_df: pd.DataFrame = pd.read_csv(
+            contexto.manifesto_arquivos,
+            encoding="utf-8-sig",
+            keep_default_na=False
+        )
         total_registros: int = len(manifesto_df)
 
         definir_total_arquivos(total_registros, "mesclagem incremental")
 
         if total_registros == 0:
-            raise ValueError("Nenhum arquivo compatível foi ingerido para mesclagem.")
+            raise ValueError("Nenhum arquivo compatível foi ingerido para processamento.")
+
+        if total_registros == 1:
+            registro_unico = manifesto_df.iloc[0]
+            caminho_local: Path = Path(str(registro_unico["caminho_local"]))
+            nome_arquivo: str = str(registro_unico["nome_arquivo"])
+            arquivo_origem: str = str(registro_unico["arquivo_origem"])
+            grupo_padrao_bruto: str = str(registro_unico["grupo_mescla_padrao"]).strip()
+            grupo_padrao: Optional[str] = grupo_padrao_bruto if grupo_padrao_bruto else None
+
+            imprimir_log(
+                fase="saída",
+                funcao="mesclar_arquivos_ingeridos",
+                etapa="Mesclagem não executada: apenas um arquivo compatível foi ingerido",
+                caminho=str(caminho_local.parent),
+                arquivo=nome_arquivo,
+                processados=0,
+                total=1,
+                icone="ℹ️",
+            )
+
+            if arquivo_origem not in arquivos_lidos:
+                arquivos_lidos.append(arquivo_origem)
+
+            imprimir_chamados_leitura_pandas({})
+
+            if not retornar_df_unificado:
+                return None
+
+            lotes_unicos: list[pd.DataFrame] = []
+            grupo_mescla_unico: str = obter_grupo_mescla(nome_arquivo, grupo_padrao)
+
+            for lote in iterar_lotes_tabulados(caminho_local):
+                lote["arquivo_origem"] = arquivo_origem
+                lote["grupo_mescla"] = grupo_mescla_unico
+                lotes_unicos.append(lote)
+
+            if not lotes_unicos:
+                return None
+
+            return pd.concat(lotes_unicos, ignore_index=True)
 
         grupos_gerados: set[str] = set()
 
@@ -1626,7 +1782,8 @@ def baixar_extrair_mesclar(
             caminho_local: Path = Path(str(registro["caminho_local"]))
             nome_arquivo: str = str(registro["nome_arquivo"])
             arquivo_origem: str = str(registro["arquivo_origem"])
-            grupo_padrao: str = str(registro["grupo_mescla_padrao"]).strip()
+            grupo_padrao_bruto: str = str(registro["grupo_mescla_padrao"]).strip()
+            grupo_padrao: Optional[str] = grupo_padrao_bruto if grupo_padrao_bruto else None
 
             imprimir_log(
                 fase="mesclagem",
@@ -1654,7 +1811,7 @@ def baixar_extrair_mesclar(
             try:
                 grupo_mescla: str = obter_grupo_mescla(
                     nome_arquivo,
-                    grupo_padrao if grupo_padrao else None
+                    grupo_padrao
                 )
                 nome_saida: str = f"mescla_{normalizar_nome_arquivo_saida(grupo_mescla)}.csv"
                 caminho_saida: Path = pasta_saida / nome_saida
@@ -1757,7 +1914,7 @@ def baixar_extrair_mesclar(
 
     imprimir_log(
         fase="inicialização",
-        funcao="baixar_extrair_mesclar_url_v2",
+        funcao="baixar_extrair_mesclar",
         etapa="Início do processamento",
         caminho=url_origem,
         arquivo=Path(urlparse(url_origem).path).name or url_origem,
@@ -1780,7 +1937,7 @@ def baixar_extrair_mesclar(
 
     imprimir_log(
         fase="finalização",
-        funcao="baixar_extrair_mesclar_url_v2",
+        funcao="baixar_extrair_mesclar",
         etapa="Processamento concluído com sucesso",
         caminho=str(contexto.pasta_execucao),
         arquivo="resultado final",
