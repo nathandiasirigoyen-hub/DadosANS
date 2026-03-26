@@ -15,6 +15,19 @@ import polars as pl
 import requests
 from bs4 import BeautifulSoup
 
+class ErroLeitura(TypedDict):
+    arquivo: str
+    erro: str
+
+
+class ResultadoMesclagem(TypedDict):
+    manifesto_arquivos: str
+    arquivos_lidos: list[str]
+    arquivos_ignorados: list[str]
+    erros: list[ErroLeitura]
+    caminhos_mesclas: dict[str, str]
+    df_unificado: Optional[pl.DataFrame]
+
 
 class ErroLeitura(TypedDict):
     """
@@ -419,6 +432,7 @@ def baixar_extrair_mesclar(
     def obter_grupo_mescla(nome_arquivo: str, grupo_padrao: Optional[str] = None) -> str:
         if grupo_padrao:
             return grupo_padrao
+
         nome_base: str = Path(nome_arquivo).stem
         nome_normalizado: str = unicodedata.normalize("NFKD", nome_base)
         nome_sem_acento: str = "".join(
@@ -426,10 +440,29 @@ def baixar_extrair_mesclar(
             for caractere in nome_normalizado
             if not unicodedata.combining(caractere)
         )
+
         nome_sem_acento = nome_sem_acento.replace("-", "_")
         partes_nome: list[str] = [parte for parte in nome_sem_acento.split("_") if parte]
+
         if not partes_nome:
             return "SEM_GRUPO"
+
+        # PATCH MÍNIMO:
+        # Caso especial para nomes como:
+        # pda-043-rpc-201505
+        # pda-043-rpc-201506
+        # Ambos devem cair no mesmo grupo: 043_RPC_2015
+        if (
+            len(partes_nome) >= 4
+            and partes_nome[0].lower() == "pda"
+            and partes_nome[-1].isdigit()
+            and len(partes_nome[-1]) == 6
+        ):
+            ano: str = partes_nome[-1][:4]
+            codigo: str = partes_nome[1].upper()
+            tipo: str = partes_nome[2].upper()
+            return f"{codigo}_{tipo}_{ano}"
+
         return partes_nome[-1].upper()
 
     def normalizar_nome_arquivo_saida(grupo_mescla: str) -> str:
@@ -583,7 +616,27 @@ def baixar_extrair_mesclar(
     def listar_arquivos_http(
         url_pasta: str,
         urls_visitadas: Optional[set[str]] = None,
+        caminho_base_raiz: Optional[PurePosixPath] = None,
     ) -> list[ArquivoDescoberto]:
+        """
+        Lista recursivamente arquivos em uma página HTTP/HTTPS, seguindo apenas
+        subpastas contidas no diretório raiz originalmente informado.
+
+        Parameters
+        ----------
+        url_pasta : str
+            URL da página/listagem.
+        urls_visitadas : Optional[set[str]], default None
+            Controle interno de recursão.
+        caminho_base_raiz : Optional[PurePosixPath], default None
+            Caminho raiz originalmente informado na primeira chamada. Usado para
+            impedir que a recursão suba para níveis superiores.
+
+        Returns
+        -------
+        list[ArquivoDescoberto]
+            Arquivos descobertos.
+        """
         if urls_visitadas is None:
             urls_visitadas = set()
 
@@ -598,7 +651,10 @@ def baixar_extrair_mesclar(
         soup = BeautifulSoup(resposta.text, "html.parser")
         url_base_parseada = urlparse(base_url)
         host_base: str = url_base_parseada.netloc
-        caminho_base = PurePosixPath(url_base_parseada.path.rstrip("/"))
+        caminho_base_atual = PurePosixPath(url_base_parseada.path.rstrip("/"))
+        if caminho_base_raiz is None:
+            caminho_base_raiz = caminho_base_atual
+
         arquivos_encontrados: list[ArquivoDescoberto] = []
 
         for link in soup.find_all("a", href=True):
@@ -613,26 +669,40 @@ def baixar_extrair_mesclar(
             if url_absoluta_parseada.netloc != host_base:
                 continue
 
-            caminho_absoluto = PurePosixPath(url_absoluta_parseada.path)
+            caminho_absoluto = PurePosixPath(url_absoluta_parseada.path.rstrip("/"))
+
+            try:
+                caminho_relativo: str = str(caminho_absoluto.relative_to(caminho_base_raiz))
+            except Exception:
+                # Ignora qualquer link que aponte para fora do diretório raiz
+                # originalmente informado (por exemplo, ../ ou caminhos irmãos).
+                continue
+
             nome_arquivo: str = caminho_absoluto.name
             if not nome_arquivo:
                 continue
 
-            eh_subpasta: bool = href.endswith("/") or str(caminho_absoluto).endswith("/")
+            eh_subpasta: bool = href.endswith("/")
             if eh_subpasta:
-                arquivos_encontrados.extend(listar_arquivos_http(url_absoluta, urls_visitadas))
+                arquivos_encontrados.extend(
+                    listar_arquivos_http(
+                        url_absoluta,
+                        urls_visitadas,
+                        caminho_base_raiz,
+                    )
+                )
                 continue
 
             extensao: str = Path(nome_arquivo).suffix.lower()
             if extensao not in extensoes_processaveis:
                 continue
 
-            try:
-                caminho_relativo: str = str(caminho_absoluto.relative_to(caminho_base))
-            except Exception:
-                caminho_relativo = nome_arquivo
-
-            arquivos_encontrados.append({"url": url_absoluta, "caminho_relativo": caminho_relativo})
+            arquivos_encontrados.append(
+                {
+                    "url": url_absoluta,
+                    "caminho_relativo": caminho_relativo,
+                }
+            )
 
         vistos: set[tuple[str, str]] = set()
         saida: list[ArquivoDescoberto] = []
@@ -684,19 +754,16 @@ def baixar_extrair_mesclar(
                 yield from iterar_lotes_csv_latin1(caminho_arquivo, separador, encoding)
                 return
 
-            leitor = pl.read_csv_batched(
+            leitor = pl.scan_csv(
                 caminho_arquivo,
                 separator=separador,
                 encoding="utf8-lossy" if encoding == "utf-8-sig" else "utf8",
-                batch_size=chunk_size_csv,
                 low_memory=True,
-                ignore_errors=False,
+                ignore_errors=True,
             )
-            while True:
-                lotes = leitor.next_batches(1)
-                if not lotes:
-                    break
-                yield lotes[0]
+
+            for lote in leitor.collect_batches(chunk_size=chunk_size_csv):
+                yield lote
             return
 
         if extensao == ".xlsx":
@@ -714,8 +781,8 @@ def baixar_extrair_mesclar(
     def escrever_df_csv(df: pl.DataFrame, caminho_saida: Path, *, append: bool) -> None:
         caminho_saida.parent.mkdir(parents=True, exist_ok=True)
         modo: str = "a" if append else "w"
-        encoding_arquivo: str = "utf-8" if append else "utf-8-sig"
-        with caminho_saida.open(modo, encoding=encoding_arquivo, newline="") as arquivo_saida:
+
+        with caminho_saida.open(modo, encoding="utf-8", newline="") as arquivo_saida:
             df.write_csv(arquivo_saida, include_header=not append)
 
     def converter_arquivo_tabular_para_csv(caminho_entrada: Path, caminho_saida_csv: Path) -> None:
@@ -1408,3 +1475,348 @@ def baixar_arquivo(url: str, nome_arquivo: Optional[str] = None) -> Path:
         arquivo.write(resposta.content)
 
     return caminho_saida
+
+def mesclar_arquivos_do_manifesto(
+    manifesto_arquivos: Path | str,
+    *,
+    pasta_saida_mesclas: Optional[Path | str] = None,
+    chunk_size_csv: int = 100_000,
+    retornar_df_unificado: bool = False,
+    verbose: bool = True,
+) -> ResultadoMesclagem:
+    """
+    Executa somente a etapa de mesclagem a partir de um manifesto já existente.
+
+    Parâmetros
+    ----------
+    manifesto_arquivos : Path | str
+        Caminho do `manifesto_arquivos.csv` gerado na ingestão anterior.
+    pasta_saida_mesclas : Optional[Path | str], default None
+        Pasta onde os arquivos `mescla_<GRUPO>.csv` serão salvos.
+        Se None, usa a mesma pasta do manifesto.
+    chunk_size_csv : int, default 100_000
+        Quantidade de linhas por lote para leitura de CSVs.
+    retornar_df_unificado : bool, default False
+        Se True, retorna um `pl.DataFrame` unificado ao final.
+    verbose : bool, default True
+        Se True, imprime logs simples no console.
+
+    Retorno
+    -------
+    ResultadoMesclagem
+        Dicionário com arquivos lidos, ignorados, erros, caminhos das mesclas
+        e `df_unificado` (quando solicitado).
+    """
+
+    manifesto_path: Path = Path(manifesto_arquivos)
+    if not manifesto_path.exists():
+        raise FileNotFoundError(f"Manifesto não encontrado: {manifesto_path}")
+
+    pasta_saida: Path = (
+        Path(pasta_saida_mesclas)
+        if pasta_saida_mesclas is not None
+        else manifesto_path.parent
+    )
+    pasta_saida.mkdir(parents=True, exist_ok=True)
+
+    arquivos_lidos: list[str] = []
+    arquivos_ignorados: list[str] = []
+    erros: list[ErroLeitura] = []
+    caminhos_mesclas: dict[str, str] = {}
+
+    def log(msg: str) -> None:
+        if verbose:
+            print(msg)
+
+    def nome_deve_ser_ignorado(nome_arquivo: str) -> bool:
+        nome_base: str = Path(nome_arquivo).stem
+        nome_normalizado: str = unicodedata.normalize("NFKD", nome_base)
+        nome_sem_acento: str = "".join(
+            caractere
+            for caractere in nome_normalizado
+            if not unicodedata.combining(caractere)
+        ).lower()
+        return "dicionario" in nome_sem_acento
+
+    def obter_grupo_mescla(
+        nome_arquivo: str,
+        grupo_padrao: Optional[str] = None,
+    ) -> str:
+        if grupo_padrao:
+            return grupo_padrao
+
+        nome_base: str = Path(nome_arquivo).stem
+        nome_normalizado: str = unicodedata.normalize("NFKD", nome_base)
+        nome_sem_acento: str = "".join(
+            caractere
+            for caractere in nome_normalizado
+            if not unicodedata.combining(caractere)
+        )
+
+        nome_sem_acento = nome_sem_acento.replace("-", "_")
+        partes_nome: list[str] = [parte for parte in nome_sem_acento.split("_") if parte]
+
+        if not partes_nome:
+            return "SEM_GRUPO"
+
+        # PATCH MÍNIMO:
+        # Caso especial para nomes como:
+        # pda-043-rpc-201505
+        # pda-043-rpc-201506
+        # Ambos devem cair no mesmo grupo: 043_RPC_2015
+        if (
+            len(partes_nome) >= 4
+            and partes_nome[0].lower() == "pda"
+            and partes_nome[-1].isdigit()
+            and len(partes_nome[-1]) == 6
+        ):
+            ano: str = partes_nome[-1][:4]
+            codigo: str = partes_nome[1].upper()
+            tipo: str = partes_nome[2].upper()
+            return f"{codigo}_{tipo}_{ano}"
+
+        return partes_nome[-1].upper()
+
+    def normalizar_nome_arquivo_saida(grupo_mescla: str) -> str:
+        grupo_normalizado: str = unicodedata.normalize("NFKD", grupo_mescla)
+        grupo_sem_acento: str = "".join(
+            caractere
+            for caractere in grupo_normalizado
+            if not unicodedata.combining(caractere)
+        ).upper()
+
+        caracteres_processados: list[str] = []
+        for caractere in grupo_sem_acento:
+            caracteres_processados.append(
+                caractere if caractere.isalnum() else "_"
+            )
+
+        nome_normalizado: str = "".join(caracteres_processados).strip("_")
+        while "__" in nome_normalizado:
+            nome_normalizado = nome_normalizado.replace("__", "_")
+
+        return nome_normalizado or "SEM_GRUPO"
+
+    def inferir_encoding_e_separador_csv(caminho_csv: Path) -> tuple[str, str]:
+        encodings_csv_teste: tuple[str, ...] = ("utf-8", "utf-8-sig", "latin1")
+        amostra_bytes: bytes = caminho_csv.read_bytes()[:100_000]
+
+        for encoding in encodings_csv_teste:
+            try:
+                texto: str = amostra_bytes.decode(encoding)
+                try:
+                    dialeto = csv.Sniffer().sniff(
+                        texto,
+                        delimiters=[",", ";", "\t", "|"],
+                    )
+                    separador: str = dialeto.delimiter
+                except Exception:
+                    separador = ";"
+                return encoding, separador
+            except Exception:
+                continue
+
+        raise ValueError(f"Falha ao inferir encoding do CSV: {caminho_csv}")
+
+    def iterar_lotes_csv_latin1(
+        caminho_arquivo: Path,
+        separador: str,
+        encoding: str,
+    ) -> Iterator[pl.DataFrame]:
+        colunas: list[str] | None = None
+        linhas_lote: list[dict[str, str]] = []
+
+        with caminho_arquivo.open("r", encoding=encoding, newline="") as arquivo_csv:
+            leitor = csv.DictReader(arquivo_csv, delimiter=separador)
+            for linha in leitor:
+                if colunas is None:
+                    colunas = list(leitor.fieldnames or linha.keys())
+
+                linhas_lote.append(
+                    {coluna: linha.get(coluna, "") for coluna in colunas}
+                )
+
+                if len(linhas_lote) >= chunk_size_csv:
+                    yield pl.DataFrame(linhas_lote)
+                    linhas_lote = []
+
+        if linhas_lote:
+            yield pl.DataFrame(linhas_lote)
+
+    def iterar_lotes_tabulados(caminho_arquivo: Path) -> Iterator[pl.DataFrame]:
+        extensao: str = caminho_arquivo.suffix.lower()
+
+        if extensao == ".csv":
+            encoding, separador = inferir_encoding_e_separador_csv(caminho_arquivo)
+
+            if encoding == "latin1":
+                yield from iterar_lotes_csv_latin1(
+                    caminho_arquivo,
+                    separador,
+                    encoding,
+                )
+                return
+
+            leitor = pl.scan_csv(
+                caminho_arquivo,
+                separator=separador,
+                encoding="utf8-lossy" if encoding == "utf-8-sig" else "utf8",
+                low_memory=True,
+                ignore_errors=True,
+            )
+
+            for lote in leitor.collect_batches(chunk_size=chunk_size_csv):
+                yield lote
+            return
+
+        if extensao == ".xlsx":
+            yield pl.read_excel(caminho_arquivo, engine="openpyxl")
+            return
+
+        if extensao == ".xls":
+            yield pl.read_excel(caminho_arquivo, engine="calamine")
+            return
+
+        if extensao == ".ods":
+            yield pl.read_excel(caminho_arquivo, engine="calamine")
+            return
+
+        raise ValueError(f"Extensão não suportada: {caminho_arquivo.suffix}")
+
+    def escrever_df_csv(df: pl.DataFrame, caminho_saida: Path, *, append: bool) -> None:
+        caminho_saida.parent.mkdir(parents=True, exist_ok=True)
+        modo: str = "a" if append else "w"
+
+        with caminho_saida.open(modo, encoding="utf-8", newline="") as arquivo_saida:
+            df.write_csv(arquivo_saida, include_header=not append)
+
+    def append_df_em_csv(df: pl.DataFrame, caminho_saida: Path) -> None:
+        escrever_cabecalho: bool = not caminho_saida.exists()
+        escrever_df_csv(df, caminho_saida, append=not escrever_cabecalho)
+
+    # Lê o manifesto com csv puro para evitar surpresas com BOM/encoding
+    with manifesto_path.open("r", encoding="utf-8-sig", newline="") as arquivo_manifesto:
+        registros_manifesto: list[dict[str, str]] = list(csv.DictReader(arquivo_manifesto))
+
+    total_registros: int = len(registros_manifesto)
+    if total_registros == 0:
+        raise ValueError("Nenhum arquivo compatível foi encontrado no manifesto.")
+
+    log(f"📘 Registros no manifesto: {total_registros}")
+
+    # Se houver somente 1 arquivo, mantém a mesma lógica da função original:
+    # não gera mescla_<GRUPO>.csv
+    if total_registros == 1:
+        registro_unico = registros_manifesto[0]
+        caminho_local: Path = Path(registro_unico["caminho_local"])
+        nome_arquivo: str = registro_unico["nome_arquivo"]
+        arquivo_origem: str = registro_unico["arquivo_origem"]
+        grupo_padrao_bruto: str = (registro_unico.get("grupo_mescla_padrao") or "").strip()
+        grupo_padrao: Optional[str] = grupo_padrao_bruto if grupo_padrao_bruto else None
+
+        if not caminho_local.exists():
+            raise FileNotFoundError(f"Arquivo do manifesto não encontrado: {caminho_local}")
+
+        log("ℹ️ Apenas 1 arquivo compatível no manifesto; mesclagem não será gerada.")
+
+        if arquivo_origem not in arquivos_lidos:
+            arquivos_lidos.append(arquivo_origem)
+
+        df_unificado: Optional[pl.DataFrame] = None
+        if retornar_df_unificado:
+            lotes_unicos: list[pl.DataFrame] = []
+            grupo_mescla_unico: str = obter_grupo_mescla(nome_arquivo, grupo_padrao)
+
+            for lote in iterar_lotes_tabulados(caminho_local):
+                lote = lote.with_columns(
+                    pl.lit(arquivo_origem).alias("arquivo_origem"),
+                    pl.lit(grupo_mescla_unico).alias("grupo_mescla"),
+                )
+                lotes_unicos.append(lote)
+
+            if lotes_unicos:
+                df_unificado = pl.concat(lotes_unicos, how="diagonal_relaxed")
+
+        return {
+            "manifesto_arquivos": str(manifesto_path),
+            "arquivos_lidos": arquivos_lidos,
+            "arquivos_ignorados": arquivos_ignorados,
+            "erros": erros,
+            "caminhos_mesclas": caminhos_mesclas,
+            "df_unificado": df_unificado,
+        }
+
+    grupos_gerados: set[str] = set()
+
+    for i, registro in enumerate(registros_manifesto, start=1):
+        caminho_local: Path = Path(registro["caminho_local"])
+        nome_arquivo: str = registro["nome_arquivo"]
+        arquivo_origem: str = registro["arquivo_origem"]
+        grupo_padrao_bruto: str = (registro.get("grupo_mescla_padrao") or "").strip()
+        grupo_padrao: Optional[str] = grupo_padrao_bruto if grupo_padrao_bruto else None
+
+        log(f"🧩 [{i}/{total_registros}] Processando: {nome_arquivo}")
+
+        if nome_deve_ser_ignorado(nome_arquivo):
+            arquivos_ignorados.append(nome_arquivo)
+            log(f"🚫 Ignorado por regra de nome: {nome_arquivo}")
+            continue
+
+        if not caminho_local.exists():
+            erros.append(
+                {
+                    "arquivo": arquivo_origem,
+                    "erro": f"Arquivo do manifesto não encontrado: {caminho_local}",
+                }
+            )
+            log(f"❌ Arquivo não encontrado: {caminho_local}")
+            continue
+
+        try:
+            grupo_mescla: str = obter_grupo_mescla(nome_arquivo, grupo_padrao)
+            nome_saida: str = f"mescla_{normalizar_nome_arquivo_saida(grupo_mescla)}.csv"
+            caminho_saida: Path = pasta_saida / nome_saida
+
+            for lote in iterar_lotes_tabulados(caminho_local):
+                lote = lote.with_columns(
+                    pl.lit(arquivo_origem).alias("arquivo_origem"),
+                    pl.lit(grupo_mescla).alias("grupo_mescla"),
+                )
+                append_df_em_csv(lote, caminho_saida)
+
+            grupos_gerados.add(grupo_mescla)
+            arquivos_lidos.append(arquivo_origem)
+            caminhos_mesclas[grupo_mescla] = str(caminho_saida)
+            log(f"✅ Mesclado grupo {grupo_mescla} -> {caminho_saida.name}")
+
+        except Exception as erro:
+            erros.append(
+                {
+                    "arquivo": arquivo_origem,
+                    "erro": f"Falha na mesclagem incremental: {erro}",
+                }
+            )
+            log(f"❌ Erro ao mesclar {nome_arquivo}: {erro}")
+
+    if not arquivos_lidos:
+        raise ValueError("Nenhum arquivo compatível foi encontrado ou lido com sucesso.")
+
+    df_unificado: Optional[pl.DataFrame] = None
+    if retornar_df_unificado and caminhos_mesclas:
+        dfs_finais: list[pl.DataFrame] = []
+        for grupo in sorted(caminhos_mesclas):
+            caminho_grupo = Path(caminhos_mesclas[grupo])
+            if caminho_grupo.exists():
+                dfs_finais.append(pl.read_csv(caminho_grupo))
+
+        if dfs_finais:
+            df_unificado = pl.concat(dfs_finais, how="diagonal_relaxed")
+
+    return {
+        "manifesto_arquivos": str(manifesto_path),
+        "arquivos_lidos": arquivos_lidos,
+        "arquivos_ignorados": arquivos_ignorados,
+        "erros": erros,
+        "caminhos_mesclas": caminhos_mesclas,
+        "df_unificado": df_unificado,
+    }
