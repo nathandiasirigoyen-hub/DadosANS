@@ -20,6 +20,7 @@ As contribuições devem respeitar os princípios centrais do projeto:
 - **Modularidade**: sempre que possível, separar ingestão, tratamento, validação e análise.
 - **Respeito ao escopo público**: o projeto usa dados públicos e deve manter esse compromisso de forma clara e responsável.
 
+
 ---
 
 ## 2. Formas de contribuir
